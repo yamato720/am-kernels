@@ -1,6 +1,6 @@
 #ifndef __DRAW_H__
 
-#define HAS_GUI
+// #define HAS_GUI
 
 #include <stdio.h>
 #include <am.h>
@@ -11,6 +11,8 @@
 #define ANSI_COLOR_GREEN 32
 #define ANSI_COLOR_WHITE 37
 #define ANSI_COLOR_RESET 0
+
+#define HAS_GUI
 
 #ifdef HAS_GUI
 #define TILE_W 4
