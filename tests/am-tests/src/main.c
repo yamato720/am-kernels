@@ -9,6 +9,8 @@ static const char *tests[256] = {
   ['d'] = "scan devices",
   ['m'] = "multiprocessor test",
   ['t'] = "real-time clock test",
+  ['c'] = "single uptime clock read",
+  ['u'] = "intentional unaligned load fault",
   ['k'] = "readkey test",
   ['v'] = "display test",
   ['a'] = "audio test",
@@ -22,6 +24,8 @@ int main(const char *args) {
     CASE('d', devscan, IOE);
     CASE('m', mp_print, MPE);
     CASE('t', rtc_test, IOE);
+    CASE('c', clock_once, IOE);
+    CASE('u', unaligned_load, IOE);
     CASE('k', keyboard_test, IOE);
     CASE('v', video_test, IOE);
     CASE('a', audio_test, IOE);

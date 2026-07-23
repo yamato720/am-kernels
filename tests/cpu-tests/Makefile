@@ -1,26 +1,38 @@
 SHELL := /bin/bash
-.PHONY: run run-bat _run-selected prepare all clean latest fpu $(ALL)
+.PHONY: config-list version run run-bat _prepare-selected _run-selected _run-one clean latest fpu $(ALL)
 
 NPC_HOME ?= $(abspath $(CURDIR)/../../../npc)
 CONSTRUCTION_MANAGER := $(NPC_HOME)/scripts/construction-manager.sh
 PERFORMANCE_SUMMARY := $(NPC_HOME)/scripts/performance-summary.sh
-RESULT := .result
 COLOR_RED := \033[1;31m
 COLOR_GREEN := \033[1;32m
 COLOR_NONE := \033[0m
 
-INTEGER_TESTS := $(basename $(notdir $(shell find tests -name '*.c' -print)))
+FPGA_FALLBACK_TEST := fpga-fallback
+INTEGER_TESTS := $(filter-out $(FPGA_FALLBACK_TEST),$(basename $(notdir $(shell find tests -name '*.c' -print))))
 FPU_TEST_ENABLED := $(if $(filter 1,$(FPU_TEST)),1,0)
-DEFAULT_ALL := $(INTEGER_TESTS) $(if $(FPU_TEST_ENABLED),fpu)
+DEFAULT_ALL := $(INTEGER_TESTS) $(if $(FPU_TEST_ENABLED),fpu $(FPGA_FALLBACK_TEST))
 ALL ?= $(DEFAULT_ALL)
 LOG_ROOT ?= $(abspath $(CURDIR)/../../../log/constructions)
 
+ifneq ($(origin host_rebuild),undefined)
+  $(error host_rebuild 已删除，请使用 host-rebuild=1)
+endif
+
 comma := ,
 VERSION_IDS := $(strip $(subst $(comma), ,$(version)))
+RUN_JOBS := $(if $(strip $(jobs)),$(strip $(jobs)),1)
 
-# 真正的单 Config 执行只发生在递归目标中；外层 run-bat 可以先拆分多个编号，
-# 因而不同 XLEN 的构造不会在同一个 Make 解析期共享 ARCH。
-ifeq ($(filter _run-selected,$(MAKECMDGOALS)),_run-selected)
+config-list:
+	@$(MAKE) -C "$(NPC_HOME)" config-list
+
+version:
+	@$(MAKE) -C "$(NPC_HOME)" version config="$(strip $(config))" version="$(strip $(version))" \
+		delete="$(strip $(delete))" yes="$(strip $(yes))"
+
+# 每个递归任务只解析一个硬件 Config/版本，因此不同 XLEN 的任务不会共享 Make 的
+# ARCH 解析期状态。`_run-one` 由 run-bat 的父进程传入独立的 RUN_RESULT_DIR。
+ifneq ($(filter _prepare-selected _run-selected _run-one,$(MAKECMDGOALS)),)
   CONFIG_RESOLUTION := $(strip $(shell $(CONSTRUCTION_MANAGER) resolve "$(NPC_HOME)" "$(strip $(config))" "$(strip $(version))"))
   ifeq ($(CONFIG_RESOLUTION),)
     $(error 无法解析 config/version)
@@ -43,8 +55,8 @@ ifeq ($(filter _run-selected,$(MAKECMDGOALS)),_run-selected)
     endif
   endif
   override ARCH := $(INFERRED_ARCH)
-  ifeq ($(CONFIG_CAPABILITY),elaborate-only)
-    $(error $(CONFIG_FQCN) 只有 elaborate-only 能力，不能执行 run/run-bat)
+  ifneq ($(CONFIG_CAPABILITY),run)
+    $(error $(CONFIG_FQCN) 不是可运行 Config，不能执行 run/run-bat)
   endif
 endif
 
@@ -55,92 +67,129 @@ run:
 		status=0; \
 		$(MAKE) --no-print-directory _run-selected RUN_MODE=interactive \
 			config="$(strip $(config))" version="$(strip $(version))" ALL="$(ALL)" \
-			build="$(strip $(build))" rebuild="$(strip $(rebuild))" ARCH="$(strip $(ARCH))" \
-			RUN_SUMMARY="$$summary" || status=$$?; \
+			build="$(strip $(build))" rebuild="$(strip $(rebuild))" host-rebuild="$(strip $(host-rebuild))" \
+			ARCH="$(strip $(ARCH))" RUN_RESULT_ROOT="$$session/items" RUN_SUMMARY="$$summary" || status=$$?; \
 		if test -s "$$summary"; then $(PERFORMANCE_SUMMARY) show "$$summary" | tee "$$session/summary.txt"; fi; \
+		if find "$$session/items" -name summary.env -type f -print -quit | grep -q .; then \
+			printf '=== 单项详细报告 ===\n'; $(PERFORMANCE_SUMMARY) details "$$session/items" | tee "$$session/details.txt"; \
+		fi; \
+		rm -rf "$$session/items"; \
 		exit $$status
 
 run-bat:
+	@case "$(RUN_JOBS)" in -1|[1-9]|[1-9][0-9]*) ;; *) echo 'jobs 只能是正整数或 -1' >&2; exit 2;; esac
+	@case "$(build)" in ''|0|1) ;; *) echo 'build 只能是 0 或 1' >&2; exit 2;; esac
+	@case "$(rebuild)" in ''|0|1) ;; *) echo 'rebuild 只能是 0 或 1' >&2; exit 2;; esac
+	@case "$(host-rebuild)" in ''|0|1) ;; *) echo 'host-rebuild 只能是 0 或 1' >&2; exit 2;; esac
+	@test "$(strip $(rebuild))" != 1 || test "$(strip $(host-rebuild))" != 1 || { echo 'rebuild=1 已包含 host 重构，不能同时提供 host-rebuild=1' >&2; exit 2; }
 	@set -e; \
-	session="$(LOG_ROOT)/runs/$$(date +%Y%m%d%H%M%S)-$$$$"; mkdir -p "$$session"; summary="$$session/summary.tsv"; \
-	if test -n "$(strip $(version))"; then versions='$(VERSION_IDS)'; else versions=''; fi; \
-	status=0; \
-	if test -z "$$versions"; then \
-		$(MAKE) --no-print-directory _run-selected RUN_MODE=batch config="$(strip $(config))" version= \
-			ALL="$(ALL)" build="$(strip $(build))" rebuild="$(strip $(rebuild))" ARCH="$(strip $(ARCH))" \
-			RUN_SUMMARY="$$summary" || status=1; \
-	else \
-		for id in $$versions; do \
-			$(MAKE) --no-print-directory _run-selected RUN_MODE=batch config="$(strip $(config))" version="$$id" \
-				ALL="$(ALL)" build="$(strip $(build))" rebuild="$(strip $(rebuild))" ARCH="$(strip $(ARCH))" \
-				RUN_SUMMARY="$$summary" || status=1; \
+		session="$(LOG_ROOT)/runs/$$(date +%Y%m%d%H%M%S)-$$$$"; mkdir -p "$$session/items"; summary="$$session/summary.tsv"; completion="$$session/completion.tsv"; counter="$$session/completion.counter"; printf '0\n' > "$$counter"; \
+		if test -n "$(strip $(version))"; then selectors='$(VERSION_IDS)'; else selectors='@config'; fi; \
+		for selector in $$selectors; do \
+			if test "$$selector" = @config; then selected_config='$(strip $(config))'; selected_version=''; else selected_config='$(strip $(config))'; selected_version="$$selector"; fi; \
+			$(MAKE) --no-print-directory _prepare-selected config="$$selected_config" version="$$selected_version" \
+				build="$(strip $(build))" rebuild="$(strip $(rebuild))" host-rebuild="$(strip $(host-rebuild))" ARCH="$(strip $(ARCH))"; \
 		done; \
-	fi; \
-	if test -s "$$summary"; then $(PERFORMANCE_SUMMARY) show "$$summary" | tee "$$session/summary.txt"; fi; \
-	exit $$status
+		total=$$(( $$(wc -w <<< "$$selectors") * $(words $(ALL)) )); active=0; status=0; \
+		report_progress() { \
+			completed=$$(find "$$session/items" -name completed -type f -print | wc -l); \
+			if test -t 1; then \
+				width=24; filled=$$(( completed * width / total )); empty=$$(( width - filled )); \
+				printf -v bar '%*s' "$$filled" ''; bar=$${bar// /#}; printf -v rest '%*s' "$$empty" ''; rest=$${rest// /-}; \
+				printf '\r\033[2K批次 [%d/%d] [%s%s]' "$$completed" "$$total" "$$bar" "$$rest"; \
+			else \
+				printf '批次进度：%s/%s\n' "$$completed" "$$total"; \
+			fi; \
+		}; \
+		printf '批次：%s 个任务，最大并行度 %s\n' "$$total" "$(RUN_JOBS)"; \
+		for selector in $$selectors; do \
+			if test "$$selector" = @config; then selected_config='$(strip $(config))'; selected_version=''; selector_key='config-$(strip $(config))'; else selected_config='$(strip $(config))'; selected_version="$$selector"; selector_key="version-$$selector"; fi; \
+			for test_name in $(ALL); do \
+				item="$$session/items/$$selector_key/$$test_name"; \
+				mkdir -p "$$item"; \
+				( $(MAKE) --no-print-directory _run-one RUN_MODE=batch TEST="$$test_name" \
+					config="$$selected_config" version="$$selected_version" ARCH="$(strip $(ARCH))" \
+					RUN_RESULT_DIR="$$item" RUN_COMPLETION_COUNTER="$$counter" > "$$item/runner.log" 2>&1 ) & \
+				active=$$((active + 1)); \
+				if test "$(RUN_JOBS)" != -1 && test "$$active" -ge "$(RUN_JOBS)"; then \
+					if ! wait -n; then status=1; fi; active=$$((active - 1)); report_progress; \
+				fi; \
+			done; \
+		done; \
+		while test "$$active" -gt 0; do if ! wait -n; then status=1; fi; active=$$((active - 1)); report_progress; done; \
+		if test -t 1; then printf '\n'; fi; \
+		$(PERFORMANCE_SUMMARY) collect "$$session/items" "$$completion" completion; \
+		$(PERFORMANCE_SUMMARY) collect "$$session/items" "$$summary" stable; \
+		if test $$(wc -l < "$$completion") -gt 1; then printf '=== 按完成顺序的单项性能 ===\n'; $(PERFORMANCE_SUMMARY) show "$$completion" | tee "$$session/completion.txt"; fi; \
+		if test $$(wc -l < "$$summary") -gt 1; then printf '=== 稳定排序的性能对比 ===\n'; $(PERFORMANCE_SUMMARY) show "$$summary" | tee "$$session/summary.txt"; fi; \
+		if find "$$session/items" -name summary.env -type f -print -quit | grep -q .; then \
+			printf '=== 单项详细报告 ===\n'; $(PERFORMANCE_SUMMARY) details "$$session/items" | tee "$$session/details.txt"; \
+		fi; \
+		while IFS= read -r detail; do \
+			if test "$$(sed -n 's/^RESULT=//p' "$$detail")" = FAIL; then \
+				item=$$(dirname $$(dirname "$$detail")); printf '=== 失败项：%s ===\n' "$$item"; \
+				tail -n 40 "$$item/log/output.log" 2>/dev/null || tail -n 40 "$$item/runner.log" 2>/dev/null || true; \
+			fi; \
+		done < <(find "$$session/items" -name summary.env -type f -print | LC_ALL=C sort); \
+		rm -rf "$$session/items" "$$counter" "$$counter.lock"; \
+		exit $$status
 
 prepare:
 	@case "$(build)" in ''|0|1) ;; *) echo 'build 只能是 0 或 1' >&2; exit 2;; esac
 	@case "$(rebuild)" in ''|0|1) ;; *) echo 'rebuild 只能是 0 或 1' >&2; exit 2;; esac
+	@case "$(host-rebuild)" in ''|0|1) ;; *) echo 'host-rebuild 只能是 0 或 1' >&2; exit 2;; esac
+	@test "$(strip $(rebuild))" != 1 || test "$(strip $(host-rebuild))" != 1 || { echo 'rebuild=1 已包含 host 重构，不能同时提供 host-rebuild=1' >&2; exit 2; }
 	@$(CONSTRUCTION_MANAGER) ensure "$(NPC_HOME)" "$(CONFIG_FQCN)" \
-		"$(if $(filter 1,$(build)),1,0)" "$(if $(filter 1,$(rebuild)),1,0)"
+		"$(if $(filter 1,$(build)),1,0)" "$(if $(filter 1,$(rebuild)),1,0)" "$(if $(filter 1,$(host-rebuild)),1,0)"
 	@test -x "$(CONSTRUCTION_DIR)/abi/nemu/nemu-exec" || { echo '构造缺少可执行 NEMU host' >&2; exit 1; }
-	@printf '=== Config=%s capability=%s ARCH=%s ===\n' "$(CONFIG_FQCN)" "$(CONFIG_CAPABILITY)" "$(ARCH)"
+	@printf '=== Config=%s ARCH=%s runtime=%s ===\n' "$(CONFIG_FQCN)" "$(ARCH)" "$(shell sed -n 's/^NEMU_BACKEND=//p' "$(CONFIG_PROFILE)")"
+
+_prepare-selected: prepare
 
 _run-selected: prepare
-	@rm -f "$(RESULT)"; : > "$(RESULT)"
-	@$(MAKE) --no-print-directory all RUN_MODE="$(RUN_MODE)" config="$(config)" version="$(version)" \
-		ALL="$(ALL)" ARCH="$(ARCH)" CONFIG_FQCN="$(CONFIG_FQCN)" CONFIG_CAPABILITY="$(CONFIG_CAPABILITY)" \
-		CONSTRUCTION_DIR="$(CONSTRUCTION_DIR)" CONFIG_PROFILE="$(CONFIG_PROFILE)" RUN_SUMMARY="$(RUN_SUMMARY)"
-	@cat "$(RESULT)"
-	@! grep -q 'FAIL' "$(RESULT)"
+	@set -e; \
+		root="$(RUN_RESULT_ROOT)"; mkdir -p "$$root"; status=0; \
+		for test_name in $(ALL); do \
+			$(MAKE) --no-print-directory _run-one RUN_MODE="$(RUN_MODE)" TEST="$$test_name" \
+				config="$(config)" version="$(version)" ARCH="$(ARCH)" RUN_RESULT_DIR="$$root/$$test_name" || status=1; \
+		done; \
+		$(PERFORMANCE_SUMMARY) collect "$$root" "$(RUN_SUMMARY)" stable; \
+		exit $$status
 
-all: $(addprefix Makefile.,$(filter-out fpu,$(ALL))) $(filter fpu,$(ALL))
-	@echo "test list [$(words $(ALL)) item(s)]: $(ALL)"
-
-$(filter-out fpu,$(ALL)): %: Makefile.%
-
-Makefile.%: tests/%.c latest
-	@printf 'NAME = %s\nSRCS = %s\ninclude $${AM_HOME}/Makefile\n' '$*' '$<' > '$@'
+_run-one:
+	@test -n "$(TEST)" || { echo '_run-one 必须提供 TEST=<用例>' >&2; exit 2; }
+	@test -n "$(RUN_RESULT_DIR)" || { echo '_run-one 必须提供 RUN_RESULT_DIR=<隔离目录>' >&2; exit 2; }
+	@test -x "$(CONSTRUCTION_DIR)/abi/nemu/nemu-exec" || { echo '预检后的构造缺少可执行 NEMU host' >&2; exit 1; }
 	@set -o pipefail; \
-	version_index=$$(sed -n 's/^VERSION_INDEX=//p' "$(CONSTRUCTION_DIR)/construction.env"); \
-	log_dir="$(LOG_ROOT)/$$version_index/$*"; mkdir -p "$$log_dir"; \
-	goal=run; test "$(RUN_MODE)" = batch && goal=run-bat; \
-	if $(MAKE) -s -f '$@' ARCH="$(ARCH)" $$goal \
-		NPC_CONSTRUCTION_DIR="$(CONSTRUCTION_DIR)" NPC_CONFIG_FQCN="$(CONFIG_FQCN)" \
-		LOG_DIR="$$log_dir" 2>&1 | tee "$$log_dir/output.log"; then \
-		result=PASS; printf '[%14s] $(COLOR_GREEN)PASS$(COLOR_NONE)\n' '$*' >> "$(RESULT)"; \
-	else \
-		result=FAIL; printf '[%14s] $(COLOR_RED)***FAIL***$(COLOR_NONE)\n' '$*' >> "$(RESULT)"; \
-	fi; \
-	echo "$$result" > "$$log_dir/status"; \
-	$(PERFORMANCE_SUMMARY) record "$(CONSTRUCTION_DIR)" '$*' "$$log_dir/output.log" "$$result" "$(RUN_SUMMARY)"
-	@rm -f '$@'
-
-fpu: latest
-	@set -o pipefail; \
-	version_index=$$(sed -n 's/^VERSION_INDEX=//p' "$(CONSTRUCTION_DIR)/construction.env"); \
-	log_dir="$(LOG_ROOT)/$$version_index/fpu"; mkdir -p "$$log_dir"; \
-	goal=run; test "$(RUN_MODE)" = batch && goal=run-bat; \
-	if test "$$(sed -n 's/^F=//p' "$(CONFIG_PROFILE)")" != 1; then \
-		printf '%s\n' '当前 Config 未启用 RISC-V F 扩展，不能运行 fpu 用例。' | tee "$$log_dir/output.log"; \
-		result=FAIL; \
-	elif $(MAKE) -s -C ../fpu-tests ARCH="$(ARCH)" "$$goal" \
-		NPC_CONSTRUCTION_DIR="$(CONSTRUCTION_DIR)" NPC_CONFIG_FQCN="$(CONFIG_FQCN)" \
-		LOG_DIR="$$log_dir" 2>&1 | tee "$$log_dir/output.log"; then \
-		result=PASS; \
-	else \
-		result=FAIL; \
-	fi; \
-	echo "$$result" > "$$log_dir/status"; \
-	if test "$$result" = PASS; then \
-		printf '[%14s] $(COLOR_GREEN)PASS$(COLOR_NONE)\n' fpu >> "$(RESULT)"; \
-	else \
-		printf '[%14s] $(COLOR_RED)***FAIL***$(COLOR_NONE)\n' fpu >> "$(RESULT)"; \
-	fi; \
-	$(PERFORMANCE_SUMMARY) record "$(CONSTRUCTION_DIR)" fpu "$$log_dir/output.log" "$$result" "$(RUN_SUMMARY)"
+		item="$(RUN_RESULT_DIR)"; work="$$item/work"; log_dir="$$item/log"; mkdir -p "$$work" "$$log_dir"; \
+		goal=run; test "$(RUN_MODE)" = batch && goal=run-bat; result=FAIL; \
+		if test "$(TEST)" = fpu; then \
+			if test "$$(sed -n 's/^F=//p' "$(CONFIG_PROFILE)")" != 1; then \
+				printf '%s\n' '当前 Config 未启用 RISC-V F 扩展，不能运行 fpu 用例。' | tee "$$log_dir/output.log"; \
+				elif $(MAKE) -s -C ../fpu-tests ARCH="$(ARCH)" "$$goal" \
+					NPC_CONSTRUCTION_DIR="$(CONSTRUCTION_DIR)" NPC_CONFIG_FQCN="$(CONFIG_FQCN)" \
+					NEMU_RUNTIME_LABEL="$(TEST)" \
+					LOG_DIR="$$log_dir" AM_BUILD_ROOT="$$work/am-build" 2>&1 | tee "$$log_dir/output.log"; then result=PASS; fi; \
+		else \
+			test -f "tests/$(TEST).c" || { echo "未知 CPU 用例：$(TEST)" >&2; exit 2; }; \
+			printf 'NAME = %s\nSRCS = %s\ninclude $${AM_HOME}/Makefile\n' "$(TEST)" "$(abspath tests/$(TEST).c)" > "$$work/Makefile"; \
+				if $(MAKE) -s -f "$$work/Makefile" ARCH="$(ARCH)" "$$goal" \
+					NPC_CONSTRUCTION_DIR="$(CONSTRUCTION_DIR)" NPC_CONFIG_FQCN="$(CONFIG_FQCN)" \
+					NEMU_RUNTIME_LABEL="$(TEST)" \
+					LOG_DIR="$$log_dir" AM_BUILD_ROOT="$$work/am-build" 2>&1 | tee "$$log_dir/output.log"; then result=PASS; fi; \
+		fi; \
+		finished_ns=$$(date +%s%N); \
+		echo "$$result" > "$$log_dir/status"; \
+		if test "$$result" = PASS; then printf '[%14s] $(COLOR_GREEN)PASS$(COLOR_NONE)\n' "$(TEST)"; else printf '[%14s] $(COLOR_RED)***FAIL***$(COLOR_NONE)\n' "$(TEST)"; fi; \
+		if test -n "$(RUN_COMPLETION_COUNTER)"; then \
+			$(PERFORMANCE_SUMMARY) record "$(CONSTRUCTION_DIR)" "$(TEST)" "$$log_dir/output.log" "$$result" "$$item/summary.tsv" "$$finished_ns" "$(RUN_COMPLETION_COUNTER)"; \
+			printf '%s\n' "$$finished_ns" > "$$item/completed"; \
+		else \
+			$(PERFORMANCE_SUMMARY) record "$(CONSTRUCTION_DIR)" "$(TEST)" "$$log_dir/output.log" "$$result" "$$item/summary.tsv"; \
+		fi; \
+		test "$$result" = PASS
 
 clean:
-	rm -rf Makefile.* build/ "$(RESULT)"
+	rm -rf Makefile.* build/
 
 latest:
