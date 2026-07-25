@@ -19,6 +19,10 @@ ifneq ($(origin host_rebuild),undefined)
   $(error host_rebuild 已删除，请使用 host-rebuild=1)
 endif
 
+ifneq ($(strip $(rebuild)),)
+  $(error rebuild 参数已删除，请先执行 make -C $(NPC_HOME) rebuild config=<Config>)
+endif
+
 comma := ,
 VERSION_IDS := $(strip $(subst $(comma), ,$(version)))
 RUN_JOBS := $(if $(strip $(jobs)),$(strip $(jobs)),1)
@@ -67,7 +71,7 @@ run:
 		status=0; \
 		$(MAKE) --no-print-directory _run-selected RUN_MODE=interactive \
 			config="$(strip $(config))" version="$(strip $(version))" ALL="$(ALL)" \
-			build="$(strip $(build))" rebuild="$(strip $(rebuild))" host-rebuild="$(strip $(host-rebuild))" \
+			build="$(strip $(build))" host-rebuild="$(strip $(host-rebuild))" \
 			ARCH="$(strip $(ARCH))" RUN_RESULT_ROOT="$$session/items" RUN_SUMMARY="$$summary" || status=$$?; \
 		if test -s "$$summary"; then $(PERFORMANCE_SUMMARY) show "$$summary" | tee "$$session/summary.txt"; fi; \
 		if find "$$session/items" -name summary.env -type f -print -quit | grep -q .; then \
@@ -79,16 +83,14 @@ run:
 run-bat:
 	@case "$(RUN_JOBS)" in -1|[1-9]|[1-9][0-9]*) ;; *) echo 'jobs 只能是正整数或 -1' >&2; exit 2;; esac
 	@case "$(build)" in ''|0|1) ;; *) echo 'build 只能是 0 或 1' >&2; exit 2;; esac
-	@case "$(rebuild)" in ''|0|1) ;; *) echo 'rebuild 只能是 0 或 1' >&2; exit 2;; esac
 	@case "$(host-rebuild)" in ''|0|1) ;; *) echo 'host-rebuild 只能是 0 或 1' >&2; exit 2;; esac
-	@test "$(strip $(rebuild))" != 1 || test "$(strip $(host-rebuild))" != 1 || { echo 'rebuild=1 已包含 host 重构，不能同时提供 host-rebuild=1' >&2; exit 2; }
 	@set -e; \
 		session="$(LOG_ROOT)/runs/$$(date +%Y%m%d%H%M%S)-$$$$"; mkdir -p "$$session/items"; summary="$$session/summary.tsv"; completion="$$session/completion.tsv"; counter="$$session/completion.counter"; printf '0\n' > "$$counter"; \
 		if test -n "$(strip $(version))"; then selectors='$(VERSION_IDS)'; else selectors='@config'; fi; \
 		for selector in $$selectors; do \
 			if test "$$selector" = @config; then selected_config='$(strip $(config))'; selected_version=''; else selected_config='$(strip $(config))'; selected_version="$$selector"; fi; \
 			$(MAKE) --no-print-directory _prepare-selected config="$$selected_config" version="$$selected_version" \
-				build="$(strip $(build))" rebuild="$(strip $(rebuild))" host-rebuild="$(strip $(host-rebuild))" ARCH="$(strip $(ARCH))"; \
+				build="$(strip $(build))" host-rebuild="$(strip $(host-rebuild))" ARCH="$(strip $(ARCH))"; \
 		done; \
 		total=$$(( $$(wc -w <<< "$$selectors") * $(words $(ALL)) )); active=0; status=0; \
 		report_progress() { \
@@ -136,11 +138,9 @@ run-bat:
 
 prepare:
 	@case "$(build)" in ''|0|1) ;; *) echo 'build 只能是 0 或 1' >&2; exit 2;; esac
-	@case "$(rebuild)" in ''|0|1) ;; *) echo 'rebuild 只能是 0 或 1' >&2; exit 2;; esac
 	@case "$(host-rebuild)" in ''|0|1) ;; *) echo 'host-rebuild 只能是 0 或 1' >&2; exit 2;; esac
-	@test "$(strip $(rebuild))" != 1 || test "$(strip $(host-rebuild))" != 1 || { echo 'rebuild=1 已包含 host 重构，不能同时提供 host-rebuild=1' >&2; exit 2; }
 	@$(CONSTRUCTION_MANAGER) ensure "$(NPC_HOME)" "$(CONFIG_FQCN)" \
-		"$(if $(filter 1,$(build)),1,0)" "$(if $(filter 1,$(rebuild)),1,0)" "$(if $(filter 1,$(host-rebuild)),1,0)"
+		"$(if $(filter 1,$(build)),1,0)" "$(if $(filter 1,$(host-rebuild)),1,0)"
 	@test -x "$(CONSTRUCTION_DIR)/abi/nemu/nemu-exec" || { echo '构造缺少可执行 NEMU host' >&2; exit 1; }
 	@printf '=== Config=%s ARCH=%s runtime=%s ===\n' "$(CONFIG_FQCN)" "$(ARCH)" "$(shell sed -n 's/^NEMU_BACKEND=//p' "$(CONFIG_PROFILE)")"
 
