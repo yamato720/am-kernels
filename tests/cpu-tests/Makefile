@@ -32,7 +32,7 @@ config-list:
 
 version:
 	@$(MAKE) -C "$(NPC_HOME)" version config="$(strip $(config))" version="$(strip $(version))" \
-		delete="$(strip $(delete))" yes="$(strip $(yes))"
+		D="$(strip $(D))" delete="$(strip $(delete))" yes="$(strip $(yes))"
 
 # 每个递归任务只解析一个硬件 Config/版本，因此不同 XLEN 的任务不会共享 Make 的
 # ARCH 解析期状态。`_run-one` 由 run-bat 的父进程传入独立的 RUN_RESULT_DIR。
