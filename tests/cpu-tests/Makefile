@@ -26,6 +26,12 @@ endif
 comma := ,
 VERSION_IDS := $(strip $(subst $(comma), ,$(version)))
 RUN_JOBS := $(if $(strip $(jobs)),$(strip $(jobs)),1)
+RUN_RESET := $(if $(strip $(reset)),$(strip $(reset)),0)
+RESET_ARGUMENT := $(if $(strip $(reset)),reset="$(strip $(reset))",)
+
+ifneq ($(filter-out 0 1,$(RUN_RESET)),)
+  $(error reset 只能是 0 或 1)
+endif
 
 config-list:
 	@$(MAKE) -C "$(NPC_HOME)" config-list
@@ -62,6 +68,11 @@ ifneq ($(filter _prepare-selected _run-selected _run-one,$(MAKECMDGOALS)),)
   ifneq ($(CONFIG_CAPABILITY),run)
     $(error $(CONFIG_FQCN) 不是可运行 Config，不能执行 run/run-bat)
   endif
+  ifneq ($(strip $(reset)),)
+    ifneq ($(CONFIG_SCOPE),fpga)
+      $(error reset=1 仅适用于 FPGA Config)
+    endif
+  endif
 endif
 
 run:
@@ -72,6 +83,7 @@ run:
 		$(MAKE) --no-print-directory _run-selected RUN_MODE=interactive \
 			config="$(strip $(config))" version="$(strip $(version))" ALL="$(ALL)" \
 			build="$(strip $(build))" host-rebuild="$(strip $(host-rebuild))" \
+			$(RESET_ARGUMENT) \
 			ARCH="$(strip $(ARCH))" RUN_RESULT_ROOT="$$session/items" RUN_SUMMARY="$$summary" || status=$$?; \
 		if test -s "$$summary"; then $(PERFORMANCE_SUMMARY) show "$$summary" | tee "$$session/summary.txt"; fi; \
 		if find "$$session/items" -name summary.env -type f -print -quit | grep -q .; then \
@@ -86,11 +98,32 @@ run-bat:
 	@case "$(host-rebuild)" in ''|0|1) ;; *) echo 'host-rebuild 只能是 0 或 1' >&2; exit 2;; esac
 	@set -e; \
 		session="$(LOG_ROOT)/runs/$$(date +%Y%m%d%H%M%S)-$$$$"; mkdir -p "$$session/items"; summary="$$session/summary.tsv"; completion="$$session/completion.tsv"; counter="$$session/completion.counter"; printf '0\n' > "$$counter"; \
+		active_pids=(); \
+		on_interrupt() { \
+			trap - INT TERM; \
+			printf '批次运行被中断；等待已启动任务退出，现场保留在：%s\n' "$$session" >&2; \
+			printf 'INTERRUPTED\n' > "$$session/status"; \
+			for pid in "$${active_pids[@]}"; do \
+				if kill -0 "$$pid" 2>/dev/null; then kill -INT "$$pid" 2>/dev/null || true; fi; \
+			done; \
+			for pid in "$${active_pids[@]}"; do wait "$$pid" 2>/dev/null || true; done; \
+			exit 130; \
+		}; \
+		trap on_interrupt INT TERM; \
 		if test -n "$(strip $(version))"; then selectors='$(VERSION_IDS)'; else selectors='@config'; fi; \
+		effective_jobs="$(RUN_JOBS)"; fpga_jobs_notice=0; \
 		for selector in $$selectors; do \
 			if test "$$selector" = @config; then selected_config='$(strip $(config))'; selected_version=''; else selected_config='$(strip $(config))'; selected_version="$$selector"; fi; \
+			resolved="$$($(CONSTRUCTION_MANAGER) resolve "$(NPC_HOME)" "$$selected_config" "$$selected_version")"; \
+			selected_scope="$$(printf '%s\n' "$$resolved" | cut -d'|' -f6)"; \
+			if test "$$selected_scope" = fpga; then \
+				if test "$$effective_jobs" != 1 && test "$$fpga_jobs_notice" = 0; then \
+					printf 'FPGA 不支持 jobs=%s；按 jobs=1 串行运行。\n' "$$effective_jobs" >&2; fpga_jobs_notice=1; \
+				fi; \
+				effective_jobs=1; \
+			fi; \
 			$(MAKE) --no-print-directory _prepare-selected config="$$selected_config" version="$$selected_version" \
-				build="$(strip $(build))" host-rebuild="$(strip $(host-rebuild))" ARCH="$(strip $(ARCH))"; \
+				build="$(strip $(build))" host-rebuild="$(strip $(host-rebuild))" $(RESET_ARGUMENT) ARCH="$(strip $(ARCH))"; \
 		done; \
 		total=$$(( $$(wc -w <<< "$$selectors") * $(words $(ALL)) )); active=0; status=0; \
 		report_progress() { \
@@ -103,17 +136,21 @@ run-bat:
 				printf '批次进度：%s/%s\n' "$$completed" "$$total"; \
 			fi; \
 		}; \
-		printf '批次：%s 个任务，最大并行度 %s\n' "$$total" "$(RUN_JOBS)"; \
+		printf '批次：%s 个任务，最大并行度 %s\n' "$$total" "$$effective_jobs"; \
 		for selector in $$selectors; do \
 			if test "$$selector" = @config; then selected_config='$(strip $(config))'; selected_version=''; selector_key='config-$(strip $(config))'; else selected_config='$(strip $(config))'; selected_version="$$selector"; selector_key="version-$$selector"; fi; \
 			for test_name in $(ALL); do \
 				item="$$session/items/$$selector_key/$$test_name"; \
 				mkdir -p "$$item"; \
-				( $(MAKE) --no-print-directory _run-one RUN_MODE=batch TEST="$$test_name" \
+				label="$${selected_version:-$(strip $(config))}"; \
+				printf '启动：[%s] %s\n' "$$label" "$$test_name"; \
+				( exec $(MAKE) --no-print-directory _run-one RUN_MODE=batch TEST="$$test_name" \
 					config="$$selected_config" version="$$selected_version" ARCH="$(strip $(ARCH))" \
+					$(RESET_ARGUMENT) \
 					RUN_RESULT_DIR="$$item" RUN_COMPLETION_COUNTER="$$counter" > "$$item/runner.log" 2>&1 ) & \
+				active_pids+=("$$!"); \
 				active=$$((active + 1)); \
-				if test "$(RUN_JOBS)" != -1 && test "$$active" -ge "$(RUN_JOBS)"; then \
+				if test "$$effective_jobs" != -1 && test "$$active" -ge "$$effective_jobs"; then \
 					if ! wait -n; then status=1; fi; active=$$((active - 1)); report_progress; \
 				fi; \
 			done; \
@@ -133,6 +170,7 @@ run-bat:
 				tail -n 40 "$$item/log/output.log" 2>/dev/null || tail -n 40 "$$item/runner.log" 2>/dev/null || true; \
 			fi; \
 		done < <(find "$$session/items" -name summary.env -type f -print | LC_ALL=C sort); \
+		trap - INT TERM; \
 		rm -rf "$$session/items" "$$counter" "$$counter.lock"; \
 		exit $$status
 
@@ -151,7 +189,7 @@ _run-selected: prepare
 		root="$(RUN_RESULT_ROOT)"; mkdir -p "$$root"; status=0; \
 		for test_name in $(ALL); do \
 			$(MAKE) --no-print-directory _run-one RUN_MODE="$(RUN_MODE)" TEST="$$test_name" \
-				config="$(config)" version="$(version)" ARCH="$(ARCH)" RUN_RESULT_DIR="$$root/$$test_name" || status=1; \
+				config="$(config)" version="$(version)" ARCH="$(ARCH)" $(RESET_ARGUMENT) RUN_RESULT_DIR="$$root/$$test_name" || status=1; \
 		done; \
 		$(PERFORMANCE_SUMMARY) collect "$$root" "$(RUN_SUMMARY)" stable; \
 		exit $$status
@@ -162,19 +200,21 @@ _run-one:
 	@test -x "$(CONSTRUCTION_DIR)/abi/nemu/nemu-exec" || { echo '预检后的构造缺少可执行 NEMU host' >&2; exit 1; }
 	@set -o pipefail; \
 		item="$(RUN_RESULT_DIR)"; work="$$item/work"; log_dir="$$item/log"; mkdir -p "$$work" "$$log_dir"; \
-		goal=run; test "$(RUN_MODE)" = batch && goal=run-bat; result=FAIL; \
+		case "$(RUN_MODE)" in interactive) goal=run ;; batch) goal=run-bat ;; *) echo 'RUN_MODE 必须是 interactive 或 batch' >&2; exit 2 ;; esac; result=FAIL; \
 		if test "$(TEST)" = fpu; then \
 			if test "$$(sed -n 's/^F=//p' "$(CONFIG_PROFILE)")" != 1; then \
 				printf '%s\n' '当前 Config 未启用 RISC-V F 扩展，不能运行 fpu 用例。' | tee "$$log_dir/output.log"; \
-				elif $(MAKE) -s -C ../fpu-tests ARCH="$(ARCH)" "$$goal" \
-					NPC_CONSTRUCTION_DIR="$(CONSTRUCTION_DIR)" NPC_CONFIG_FQCN="$(CONFIG_FQCN)" \
-					NEMU_RUNTIME_LABEL="$(TEST)" \
+			elif $(MAKE) -s -C ../fpu-tests ARCH="$(ARCH)" "$$goal" \
+				NPC_CONSTRUCTION_DIR="$(CONSTRUCTION_DIR)" NPC_CONFIG_FQCN="$(CONFIG_FQCN)" \
+				$(RESET_ARGUMENT) \
+				NEMU_RUNTIME_LABEL="$(TEST)" \
 					LOG_DIR="$$log_dir" AM_BUILD_ROOT="$$work/am-build" 2>&1 | tee "$$log_dir/output.log"; then result=PASS; fi; \
 		else \
 			test -f "tests/$(TEST).c" || { echo "未知 CPU 用例：$(TEST)" >&2; exit 2; }; \
 			printf 'NAME = %s\nSRCS = %s\ninclude $${AM_HOME}/Makefile\n' "$(TEST)" "$(abspath tests/$(TEST).c)" > "$$work/Makefile"; \
 				if $(MAKE) -s -f "$$work/Makefile" ARCH="$(ARCH)" "$$goal" \
 					NPC_CONSTRUCTION_DIR="$(CONSTRUCTION_DIR)" NPC_CONFIG_FQCN="$(CONFIG_FQCN)" \
+					$(RESET_ARGUMENT) \
 					NEMU_RUNTIME_LABEL="$(TEST)" \
 					LOG_DIR="$$log_dir" AM_BUILD_ROOT="$$work/am-build" 2>&1 | tee "$$log_dir/output.log"; then result=PASS; fi; \
 		fi; \
