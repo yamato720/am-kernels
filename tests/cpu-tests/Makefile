@@ -1,5 +1,5 @@
 SHELL := /bin/bash
-.PHONY: config-list version run run-bat _prepare-selected _run-selected _run-one clean latest fpu $(ALL)
+.PHONY: config-list version run run-bat _prepare-selected _run-selected _check-run-mode _run-one clean latest fpu $(ALL)
 
 NPC_HOME ?= $(abspath $(CURDIR)/../../../npc)
 CONSTRUCTION_MANAGER := $(NPC_HOME)/scripts/construction-manager.sh
@@ -65,7 +65,7 @@ ifneq ($(filter _prepare-selected _run-selected _run-one,$(MAKECMDGOALS)),)
     endif
   endif
   override ARCH := $(INFERRED_ARCH)
-  ifneq ($(CONFIG_CAPABILITY),run)
+  ifeq ($(filter run batch,$(CONFIG_CAPABILITY)),)
     $(error $(CONFIG_FQCN) 不是可运行 Config，不能执行 run/run-bat)
   endif
   ifneq ($(strip $(reset)),)
@@ -78,7 +78,7 @@ endif
 run:
 	@test "$(words $(VERSION_IDS))" -le 1 || { echo 'run 只接受一个 version 编号' >&2; exit 2; }
 	@set -e; \
-		session="$(LOG_ROOT)/runs/$$(date +%Y%m%d%H%M%S)-$$$$"; mkdir -p "$$session"; summary="$$session/summary.tsv"; \
+		session="$(LOG_ROOT)/runs/$$(date +%Y%m%d%H%M%S)-$$$$"; mkdir -p "$$session/items"; summary="$$session/summary.tsv"; \
 		status=0; \
 		$(MAKE) --no-print-directory _run-selected RUN_MODE=interactive \
 			config="$(strip $(config))" version="$(strip $(version))" ALL="$(ALL)" \
@@ -184,7 +184,11 @@ prepare:
 
 _prepare-selected: prepare
 
-_run-selected: prepare
+_check-run-mode:
+	@test "$(RUN_MODE)" != interactive || test "$(CONFIG_CAPABILITY)" != batch || \
+		{ echo '该 PerformanceMonitor Config 仅支持 run-bat。' >&2; exit 2; }
+
+_run-selected: _check-run-mode prepare
 	@set -e; \
 		root="$(RUN_RESULT_ROOT)"; mkdir -p "$$root"; status=0; \
 		for test_name in $(ALL); do \
