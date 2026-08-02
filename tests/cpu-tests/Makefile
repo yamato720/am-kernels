@@ -208,17 +208,17 @@ _run-one:
 		if test "$(TEST)" = fpu; then \
 			if test "$$(sed -n 's/^F=//p' "$(CONFIG_PROFILE)")" != 1; then \
 				printf '%s\n' '当前 Config 未启用 RISC-V F 扩展，不能运行 fpu 用例。' | tee "$$log_dir/output.log"; \
-			elif $(MAKE) -s -C ../fpu-tests ARCH="$(ARCH)" "$$goal" \
-				NPC_CONSTRUCTION_DIR="$(CONSTRUCTION_DIR)" NPC_CONFIG_FQCN="$(CONFIG_FQCN)" \
-				$(RESET_ARGUMENT) \
+				elif $(MAKE) -s -C ../fpu-tests ARCH="$(ARCH)" "$$goal" \
+					NPC_CONSTRUCTION_DIR="$(CONSTRUCTION_DIR)" NPC_CONFIG_FQCN="$(CONFIG_FQCN)" \
+					$(RESET_ARGUMENT) \
 				NEMU_RUNTIME_LABEL="$(TEST)" \
 					LOG_DIR="$$log_dir" AM_BUILD_ROOT="$$work/am-build" 2>&1 | tee "$$log_dir/output.log"; then result=PASS; fi; \
 		else \
 			test -f "tests/$(TEST).c" || { echo "未知 CPU 用例：$(TEST)" >&2; exit 2; }; \
 			printf 'NAME = %s\nSRCS = %s\ninclude $${AM_HOME}/Makefile\n' "$(TEST)" "$(abspath tests/$(TEST).c)" > "$$work/Makefile"; \
-				if $(MAKE) -s -f "$$work/Makefile" ARCH="$(ARCH)" "$$goal" \
-					NPC_CONSTRUCTION_DIR="$(CONSTRUCTION_DIR)" NPC_CONFIG_FQCN="$(CONFIG_FQCN)" \
-					$(RESET_ARGUMENT) \
+					if $(MAKE) -s -f "$$work/Makefile" ARCH="$(ARCH)" "$$goal" \
+						NPC_CONSTRUCTION_DIR="$(CONSTRUCTION_DIR)" NPC_CONFIG_FQCN="$(CONFIG_FQCN)" \
+						$(RESET_ARGUMENT) \
 					NEMU_RUNTIME_LABEL="$(TEST)" \
 					LOG_DIR="$$log_dir" AM_BUILD_ROOT="$$work/am-build" 2>&1 | tee "$$log_dir/output.log"; then result=PASS; fi; \
 		fi; \
