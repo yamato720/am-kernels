@@ -80,7 +80,7 @@ run:
 	@set -e; \
 		session="$(LOG_ROOT)/runs/$$(date +%Y%m%d%H%M%S)-$$$$"; mkdir -p "$$session/items"; summary="$$session/summary.tsv"; \
 		status=0; \
-		$(MAKE) --no-print-directory _run-selected RUN_MODE=interactive \
+		$(MAKE) --no-print-directory _run-selected RUN_MODE=batch \
 			config="$(strip $(config))" version="$(strip $(version))" ALL="$(ALL)" \
 			build="$(strip $(build))" host-rebuild="$(strip $(host-rebuild))" \
 			$(RESET_ARGUMENT) \
