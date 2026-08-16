@@ -80,7 +80,7 @@ run:
 	@set -e; \
 		session="$(LOG_ROOT)/runs/$$(date +%Y%m%d%H%M%S)-$$$$"; mkdir -p "$$session/items"; summary="$$session/summary.tsv"; \
 		status=0; \
-		$(MAKE) --no-print-directory _run-selected RUN_MODE=batch \
+		$(MAKE) --no-print-directory _run-selected RUN_MODE=interactive \
 			config="$(strip $(config))" version="$(strip $(version))" ALL="$(ALL)" \
 			build="$(strip $(build))" host-rebuild="$(strip $(host-rebuild))" \
 			$(RESET_ARGUMENT) \
@@ -92,6 +92,8 @@ run:
 		rm -rf "$$session/items"; \
 		exit $$status
 
+# 并行批次明确等待已记录 PID，避免 `wait -n` 在 shell 已回收子进程时误报失败；
+# 每项的完成顺序仍由 performance-summary 的原子计数器记录。
 run-bat:
 	@case "$(RUN_JOBS)" in -1|[1-9]|[1-9][0-9]*) ;; *) echo 'jobs 只能是正整数或 -1' >&2; exit 2;; esac
 	@case "$(build)" in ''|0|1) ;; *) echo 'build 只能是 0 或 1' >&2; exit 2;; esac
@@ -136,6 +138,12 @@ run-bat:
 				printf '批次进度：%s/%s\n' "$$completed" "$$total"; \
 			fi; \
 		}; \
+		wait_for_oldest() { \
+			local pid="$${active_pids[0]}"; \
+			active_pids=("$${active_pids[@]:1}"); \
+			if ! wait "$$pid"; then status=1; fi; \
+			active=$$((active - 1)); report_progress; \
+		}; \
 		printf '批次：%s 个任务，最大并行度 %s\n' "$$total" "$$effective_jobs"; \
 		for selector in $$selectors; do \
 			if test "$$selector" = @config; then selected_config='$(strip $(config))'; selected_version=''; selector_key='config-$(strip $(config))'; else selected_config='$(strip $(config))'; selected_version="$$selector"; selector_key="version-$$selector"; fi; \
@@ -151,11 +159,11 @@ run-bat:
 				active_pids+=("$$!"); \
 				active=$$((active + 1)); \
 				if test "$$effective_jobs" != -1 && test "$$active" -ge "$$effective_jobs"; then \
-					if ! wait -n; then status=1; fi; active=$$((active - 1)); report_progress; \
+					wait_for_oldest; \
 				fi; \
 			done; \
 		done; \
-		while test "$$active" -gt 0; do if ! wait -n; then status=1; fi; active=$$((active - 1)); report_progress; done; \
+		while test "$$active" -gt 0; do wait_for_oldest; done; \
 		if test -t 1; then printf '\n'; fi; \
 		$(PERFORMANCE_SUMMARY) collect "$$session/items" "$$completion" completion; \
 		$(PERFORMANCE_SUMMARY) collect "$$session/items" "$$summary" stable; \
